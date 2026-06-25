@@ -2081,6 +2081,40 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+# Per-task subagent model tiers Raven may request via delegate_task(model=...).
+# When no model is passed, the child uses the configured delegation.model
+# (gpt-5.4-mini — the cheap default). Off-allowlist ids fail open to the
+# default so a hallucinated/expensive id can never escalate cost or wedge a
+# spawn. Keep this in lockstep with the schema 'model' description below and
+# Raven's orchestrator guidance.
+_SUBAGENT_MODEL_ALLOWLIST = frozenset(
+    {
+        "gpt-5.4-mini",   # cheap default — routine subtasks (reads, summaries, status, simple edits)
+        "gpt-5.3-codex",  # code-heavy subtasks — refactors, patches, code review
+        "gpt-5.4",        # hard reasoning subtasks — architecture, tricky multi-step analysis
+    }
+)
+
+
+def _resolve_subagent_model(requested: Optional[str], default: Optional[str]) -> Optional[str]:
+    """Pick a per-subtask model. A per-task ``requested`` value wins when it is
+    on the allowlist; otherwise fail open to the configured delegation default
+    (``creds["model"]``). This keeps the model from routing a child onto an
+    arbitrary/expensive model by emitting an unknown id, and means "no model
+    arg" → the cheap default."""
+    if not requested or not str(requested).strip():
+        return default
+    model = str(requested).strip()
+    if model in _SUBAGENT_MODEL_ALLOWLIST:
+        return model
+    logger.warning(
+        "delegate_task: ignoring off-allowlist subagent model %r; using default %r",
+        model,
+        default,
+    )
+    return default
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2091,19 +2125,25 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    model: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, toolsets, role, model)
+      - Batch:  provide tasks array [{goal, context, toolsets, role, model}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'model' parameter right-sizes the model per subtask (per-task value in
+    the tasks array beats the top-level one). Omit it to use the cheap default
+    (delegation.model). Allowed: gpt-5.4-mini / gpt-5.3-codex / gpt-5.4; any
+    other value falls back to the default.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2192,7 +2232,7 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role, "model": model}
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2238,7 +2278,7 @@ def delegate_task(
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=_resolve_subagent_model(t.get("model"), creds["model"]),
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
@@ -3070,6 +3110,19 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "model": {
+                "type": "string",
+                "enum": ["gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.4"],
+                "description": (
+                    "Right-size the model to the subtask. OMIT for routine work "
+                    "— the default (gpt-5.4-mini) is cheap and fast and handles "
+                    "most delegations. Set 'gpt-5.3-codex' for code-heavy work "
+                    "(refactors, patches, code review). Set 'gpt-5.4' for genuinely "
+                    "hard reasoning (architecture, tricky multi-step analysis). "
+                    "Default to omitting it; only escalate when the subtask truly "
+                    "needs it. Per-task value (in 'tasks') overrides this."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3102,6 +3155,11 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "enum": ["gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.4"],
+                            "description": "Per-task model override. Omit for the cheap default (gpt-5.4-mini); 'gpt-5.3-codex' for code, 'gpt-5.4' for hard reasoning.",
                         },
                     },
                     "required": ["goal"],
